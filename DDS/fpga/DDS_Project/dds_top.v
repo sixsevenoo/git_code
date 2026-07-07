@@ -14,7 +14,8 @@ module dds_top (
     input           fm_dev_sel,     // FM频偏选择: 0=5kHz, 1=10kHz
     output reg [13:0] dac_data,     // 14位数据总线 (连接DAC的 B1~B14)
     output          dac_clk,        // DAC时钟 (直接输出系统时钟)
-    output          uart_txd        // UART发送到PC (接USB转串口, 115200bps)
+    output          uart_txd,       // UART发送到PC (接USB转串口, 115200bps)
+    input           uart_rxd        // 3519 UART接收 (控制命令输入)
 );
 
 // ========== 参数定义 ==========
@@ -25,6 +26,75 @@ localparam ROM_DEPTH = 1024;
 
 // 修正1: 使用近似值，每100Hz对应的FTW = 100 * 2^32 / 50MHz ≈ 8589.93，取整8590
 localparam FTW_STEP = 32'd8590;
+
+// ========== UART RX 命令解码 (3519→FPGA) ==========
+// 命令字节: 'I'(inc) 'D'(dec) 'M'(mode) 'S'(sub) 'F'(fm) 'R'(reset)
+
+wire [7:0] uart_cmd_byte;
+wire       uart_cmd_valid;
+reg        uart_cmd_inc_pulse;
+reg        uart_cmd_dec_pulse;
+reg        uart_cmd_mode_pulse;
+reg        uart_cmd_sub_pulse;
+reg        uart_cmd_fm_pulse;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        uart_cmd_inc_pulse  <= 1'b0;
+        uart_cmd_dec_pulse  <= 1'b0;
+        uart_cmd_mode_pulse <= 1'b0;
+        uart_cmd_sub_pulse  <= 1'b0;
+        uart_cmd_fm_pulse   <= 1'b0;
+    end else begin
+        uart_cmd_inc_pulse  <= 1'b0;   // 默认: 脉宽1周期
+        uart_cmd_dec_pulse  <= 1'b0;
+        uart_cmd_mode_pulse <= 1'b0;
+        uart_cmd_sub_pulse  <= 1'b0;
+        uart_cmd_fm_pulse   <= 1'b0;
+        if (uart_cmd_valid) begin
+            case (uart_cmd_byte)
+                8'h49, 8'h69: uart_cmd_inc_pulse  <= 1'b1;   // 'I'/'i'
+                8'h44, 8'h64: uart_cmd_dec_pulse  <= 1'b1;   // 'D'/'d'
+                8'h4D, 8'h6D: uart_cmd_mode_pulse <= 1'b1;   // 'M'/'m'
+                8'h53, 8'h73: uart_cmd_sub_pulse  <= 1'b1;   // 'S'/'s'
+                8'h46, 8'h66: uart_cmd_fm_pulse   <= 1'b1;   // 'F'/'f'
+                // 'R'/'r' 复位直接通过rst_n逻辑处理
+            endcase
+        end
+    end
+end
+
+// UART模式/子模式/FM内部寄存器 (由3519命令控制)
+reg [1:0] uart_mode_reg;
+reg       uart_sub_reg;
+reg       uart_fm_reg;
+
+// FPGA按键复位也会重置UART寄存器, 保证同步
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        uart_mode_reg <= 2'b00;
+        uart_sub_reg  <= 1'b0;
+        uart_fm_reg   <= 1'b0;
+    end else begin
+        if (uart_cmd_mode_pulse)
+            uart_mode_reg <= uart_mode_reg + 1'b1;   // 循环: 00→01→10→11→00
+        if (uart_cmd_sub_pulse)
+            uart_sub_reg <= ~uart_sub_reg;
+        if (uart_cmd_fm_pulse)
+            uart_fm_reg <= ~uart_fm_reg;
+    end
+end
+
+// 综合控制信号: 外部引脚优先, UART命令补充
+// mode_sel: 外部非00时用外部, 否则用UART值
+// sub_mode/fm_dev_sel: 外部为1时覆盖, 否则用UART值
+wire [1:0] mode_sel_eff = (mode_sel != 2'b00) ? mode_sel : uart_mode_reg;
+wire       sub_mode_eff = sub_mode | uart_sub_reg;
+wire       fm_dev_eff   = fm_dev_sel | uart_fm_reg;
+
+// 频率增/减: FPGA消抖边沿 OR UART命令脉冲
+wire       inc_cmd = inc_rise | uart_cmd_inc_pulse;
+wire       dec_cmd = dec_rise | uart_cmd_dec_pulse;
 
 // 频率控制
 reg  [31:0] freq_code;              // 频率代码 (单位: 100Hz, 范围 1~100000)
@@ -143,9 +213,9 @@ always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
         freq_code <= 32'd1000;          // 上电默认 100kHz (更实用的初始频率)
     else begin
-        if (inc_rise && (freq_code < 32'd100000))
+        if (inc_cmd && (freq_code < 32'd100000))
             freq_code <= freq_code + 1;
-        else if (dec_rise && (freq_code > 32'd1))
+        else if (dec_cmd && (freq_code > 32'd1))
             freq_code <= freq_code - 1;
     end
 end
@@ -208,7 +278,7 @@ wire [31:0] fc_ftw_tmp = (freq_code < 32'd1000) ? 32'd858993 : freq_code * FTW_S
 assign fc_ftw = fc_ftw_tmp;
 localparam FTW_5K = 32'd429500;
 localparam FTW_10K = 32'd859000;
-assign delta_f_ftw = fm_dev_sel ? FTW_10K : FTW_5K;
+assign delta_f_ftw = fm_dev_eff ? FTW_10K : FTW_5K;
 assign offset = mod_sin - 14'd8192;   // 有符号偏移
 
 // 修正2: 将乘积结果改为32位，避免索引越界
@@ -257,13 +327,13 @@ assign psk_raw = sin_rom[phase_psk[31:22]];
 assign psk_out = baseband ? psk_raw : (~psk_raw + 1'b1);
 assign ask_out = baseband ? psk_raw : 14'd0;
 
-// ========== 模式选择 ==========
+// ========== 模式选择 (外部引脚 + UART命令合并) ==========
 always @(*) begin
-    case (mode_sel)
+    case (mode_sel_eff)
         2'b00:   dac_data_reg = sine_data;
         2'b01:   dac_data_reg = am_out;
         2'b10:   dac_data_reg = fm_out;
-        2'b11:   dac_data_reg = (sub_mode == 0) ? psk_out : ask_out;
+        2'b11:   dac_data_reg = (sub_mode_eff == 0) ? psk_out : ask_out;
         default: dac_data_reg = sine_data;
     endcase
 end
@@ -379,7 +449,7 @@ always @(posedge clk or negedge rst_n) begin
     end
 end
 
-// UART TX实例化
+// UART TX实例化 (发送波形到PC)
 uart_tx #(.BAUD_CNT(BAUD_115200)) uart_inst (
     .clk    (clk),
     .rst_n  (rst_n),
@@ -387,6 +457,15 @@ uart_tx #(.BAUD_CNT(BAUD_115200)) uart_inst (
     .tx_en  (uart_tx_en),
     .tx_busy(uart_busy),
     .txd    (uart_txd)
+);
+
+// UART RX实例化 (接收3519控制命令)
+uart_rx #(.BAUD_CNT(BAUD_115200)) uart_rx_inst (
+    .clk    (clk),
+    .rst_n  (rst_n),
+    .rxd    (uart_rxd),
+    .rx_data(uart_cmd_byte),
+    .rx_done(uart_cmd_valid)
 );
 
 endmodule
@@ -465,6 +544,103 @@ module uart_tx #(
                         baud_cnt <= 9'd0;
                         tx_busy  <= 1'b0;
                         state    <= IDLE;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+
+// ============================================================
+// UART 接收模块 (8N1, 115200bps)
+// 在时钟中点采样, 检测起始位下降沿
+// ============================================================
+module uart_rx #(
+    parameter BAUD_CNT = 434           // 50000000 / 115200 = 434
+) (
+    input           clk,
+    input           rst_n,
+    input           rxd,
+    output reg [7:0] rx_data,
+    output reg      rx_done
+);
+
+    localparam  BAUD_HALF = BAUD_CNT >> 1;   // 中点: 217
+    localparam  IDLE  = 2'd0,
+                START = 2'd1,
+                DATA  = 2'd2,
+                STOP  = 2'd3;
+
+    reg [1:0] state;
+    reg [8:0] baud_cnt;
+    reg [2:0] bit_idx;
+    reg [7:0] shift_reg;
+
+    // 同步器 + 下降沿检测
+    reg rxd_s1, rxd_s2, rxd_prev;
+    wire start_edge;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rxd_s1 <= 1'b1;
+            rxd_s2 <= 1'b1;
+            rxd_prev <= 1'b1;
+        end else begin
+            rxd_s1   <= rxd;
+            rxd_s2   <= rxd_s1;
+            rxd_prev <= rxd_s2;
+        end
+    end
+    assign start_edge = rxd_prev & ~rxd_s2;   // 下降沿
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state     <= IDLE;
+            baud_cnt  <= 9'd0;
+            bit_idx   <= 3'd0;
+            shift_reg <= 8'd0;
+            rx_data   <= 8'd0;
+            rx_done   <= 1'b0;
+        end else begin
+            rx_done <= 1'b0;                    // 默认: 脉冲1周期
+            case (state)
+                IDLE: begin
+                    baud_cnt <= 9'd0;
+                    if (start_edge)
+                        state <= START;
+                end
+
+                START: begin
+                    if (baud_cnt >= BAUD_HALF) begin   // 采样起始位中点
+                        baud_cnt <= 9'd0;
+                        if (!rxd_s2)                    // 仍然是低→有效起始位
+                            state <= DATA;
+                        else
+                            state <= IDLE;              // 毛刺, 重新等待
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                DATA: begin
+                    if (baud_cnt >= BAUD_CNT - 1) begin
+                        baud_cnt  <= 9'd0;
+                        shift_reg <= {rxd_s2, shift_reg[7:1]};
+                        if (bit_idx >= 3'd7) begin
+                            state <= STOP;
+                        end else
+                            bit_idx <= bit_idx + 1;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                STOP: begin
+                    if (baud_cnt >= BAUD_CNT - 1) begin
+                        rx_data <= shift_reg;
+                        rx_done <= 1'b1;
+                        state   <= IDLE;
                     end else
                         baud_cnt <= baud_cnt + 1;
                 end
