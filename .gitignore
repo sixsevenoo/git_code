@@ -1,0 +1,68 @@
+# Quartus II 编译产物 & 临时文件
+db/
+incremental_db/
+output_files/
+greybox_tmp/
+*.bak
+*.done
+*.jdi
+*.pin
+*.sof
+*.pof
+*.rpt
+*.summary
+*.qmsg
+*.smsg
+*.ddb
+*.hdb
+*.cdb
+*.tdb
+*.rcfdb
+*.hbdb*
+*.ammdb
+*.bpm
+*.idb
+*.logdb
+*.rdb
+*.hsd
+*.kpt
+*.sci
+*.cnf.*
+*.cnf.cdb
+*.cnf.hdb
+*.cmp.*
+*.map.*
+*.fit.*
+*.asm.*
+*.sta.*
+*.eda.*
+*.pplq.*
+*.hier_info
+*.hif
+*.ipinfo
+*.lpc.*
+*.smart_action.txt
+*.tmw_info
+*.db_info
+*.cbx.xml
+*.flow.rpt
+*.tinv
+*_mmp_map.log
+*.vpr.ammdb
+prev_cmp_*.qmsg
+logic_util_heursitic.dat
+*.root_partition.*
+
+# 编译分区
+compiled_partitions/
+
+# 备份文件
+*.bak
+*.~*
+
+# HEX初始化文件（保留）
+# !*.hex
+
+# 系统文件
+.DS_Store
+Thumbs.db
