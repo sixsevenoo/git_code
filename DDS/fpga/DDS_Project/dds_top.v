@@ -13,7 +13,8 @@ module dds_top (
     input           freq_dec,       // 频率减小 (按键)
     input           fm_dev_sel,     // FM频偏选择: 0=5kHz, 1=10kHz
     output reg [13:0] dac_data,     // 14位数据总线 (连接DAC的 B1~B14)
-    output          dac_clk         // DAC时钟 (直接输出系统时钟)
+    output          dac_clk,        // DAC时钟 (直接输出系统时钟)
+    output          uart_txd        // UART发送到PC (接USB转串口, 115200bps)
 );
 
 // ========== 参数定义 ==========
@@ -23,7 +24,7 @@ localparam ADDR_WIDTH = 10;
 localparam ROM_DEPTH = 1024;
 
 // 修正1: 使用近似值，每100Hz对应的FTW = 100 * 2^32 / 50MHz ≈ 8589.93，取整8590
-localparam FTW_STEP = 32'd8590;     
+localparam FTW_STEP = 32'd8590;
 
 // 频率控制
 reg  [31:0] freq_code;              // 频率代码 (单位: 100Hz, 范围 1~100000)
@@ -273,5 +274,202 @@ end
 
 // 将DAC时钟反相，使数据在DAC时钟上升沿前已有半个周期稳定时间
 assign dac_clk = ~clk;
+
+// ========== UART 发送模块 (VOFA+ 波形显示) ==========
+// 格式: 十进制ASCII + CR+LF, 115200bps, 8N1
+// DDS输出值连续发送, 发送频率由UART速率自动限制
+// VOFA+选择 "RowData" (文本) 模式即可显示
+
+localparam BAUD_115200 = 9'd434;   // 50000000 / 115200
+// localparam BAUD_921600 = 9'd54; // 如需更高速率, 取消注释并注释上行
+
+// UART发送控制信号
+wire        uart_busy;
+reg  [7:0]  uart_tx_byte;
+reg         uart_tx_en;
+
+// 采样/发送状态机
+localparam  UART_IDLE    = 3'd0,
+            UART_COMPUTE = 3'd1,
+            UART_SEND_D  = 3'd2,
+            UART_WAIT_D  = 3'd3,
+            UART_CR      = 3'd4,
+            UART_WAIT_CR = 3'd5,
+            UART_LF      = 3'd6,
+            UART_WAIT_LF = 3'd7;
+
+reg [2:0] uart_state;
+reg [13:0] uart_sample;
+reg [4:0] uart_digits[0:4];
+reg [2:0] uart_digit_idx;
+reg       uart_sent_nonzero;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        uart_state <= UART_IDLE;
+        uart_tx_en <= 1'b0;
+        uart_sample <= 14'd0;
+        uart_digit_idx <= 3'd0;
+        uart_sent_nonzero <= 1'b0;
+    end else begin
+        uart_tx_en <= 1'b0;                             // 默认: 脉冲只持续1周期
+        case (uart_state)
+            // ========================
+            UART_IDLE: begin
+                if (!uart_busy) begin
+                    uart_sample <= dac_data;
+                    uart_state   <= UART_COMPUTE;
+                end
+            end
+            // ========================
+            UART_COMPUTE: begin                          // 计算BCD码 (纯组合逻辑路径)
+                uart_digits[0] <= uart_sample % 10;
+                uart_digits[1] <= (uart_sample / 10) % 10;
+                uart_digits[2] <= (uart_sample / 100) % 10;
+                uart_digits[3] <= (uart_sample / 1000) % 10;
+                uart_digits[4] <= (uart_sample / 10000) % 10;
+                uart_digit_idx   <= 3'd4;                // 从最高位开始
+                uart_sent_nonzero <= 1'b0;
+                uart_state <= UART_SEND_D;
+            end
+            // ========================
+            UART_SEND_D: begin                           // 逐位发送, 抑制前导零
+                if (uart_digit_idx == 3'd0) begin
+                    uart_tx_byte <= "0" + uart_digits[0]; // 最后1位一定发
+                    uart_tx_en   <= 1'b1;
+                    uart_state   <= UART_WAIT_D;
+                    uart_digit_idx <= 3'd5;              // 标记数字发完
+                end else if (uart_digits[uart_digit_idx] != 0 || uart_sent_nonzero) begin
+                    uart_tx_byte <= "0" + uart_digits[uart_digit_idx];
+                    uart_tx_en   <= 1'b1;
+                    uart_state   <= UART_WAIT_D;
+                    uart_sent_nonzero <= 1'b1;
+                    uart_digit_idx <= uart_digit_idx - 1;
+                end else begin
+                    uart_digit_idx <= uart_digit_idx - 1; // 跳过前导零
+                end
+            end
+            // ========================
+            UART_WAIT_D: begin
+                if (!uart_busy) begin                    // 等待字节发送完成
+                    uart_state <= (uart_digit_idx == 3'd5) ? UART_CR : UART_SEND_D;
+                end
+            end
+            // ========================
+            UART_CR: begin                               // 发送回车 CR
+                uart_tx_byte <= 8'h0D;
+                uart_tx_en   <= 1'b1;
+                uart_state   <= UART_WAIT_CR;
+            end
+            UART_WAIT_CR: begin
+                if (!uart_busy)
+                    uart_state <= UART_LF;
+            end
+            // ========================
+            UART_LF: begin                               // 发送换行 LF
+                uart_tx_byte <= 8'h0A;
+                uart_tx_en   <= 1'b1;
+                uart_state   <= UART_WAIT_LF;
+            end
+            UART_WAIT_LF: begin
+                if (!uart_busy)
+                    uart_state <= UART_IDLE;             // 回到IDLE, 立即发送下个采样
+            end
+        endcase
+    end
+end
+
+// UART TX实例化
+uart_tx #(.BAUD_CNT(BAUD_115200)) uart_inst (
+    .clk    (clk),
+    .rst_n  (rst_n),
+    .tx_data(uart_tx_byte),
+    .tx_en  (uart_tx_en),
+    .tx_busy(uart_busy),
+    .txd    (uart_txd)
+);
+
+endmodule
+
+
+// ============================================================
+// UART 发送模块 (8N1, 115200bps)
+// ============================================================
+module uart_tx #(
+    parameter BAUD_CNT = 434          // 50000000 / 115200 = 434
+) (
+    input           clk,
+    input           rst_n,
+    input   [7:0]   tx_data,
+    input           tx_en,
+    output reg      tx_busy,
+    output reg      txd
+);
+
+    localparam  IDLE  = 2'd0,
+                START = 2'd1,
+                DATA  = 2'd2,
+                STOP  = 2'd3;
+
+    reg [1:0] state;
+    reg [8:0] baud_cnt;
+    reg [2:0] bit_idx;
+    reg [7:0] shift_reg;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state     <= IDLE;
+            txd       <= 1'b1;
+            tx_busy   <= 1'b0;
+            baud_cnt  <= 9'd0;
+            shift_reg <= 8'd0;
+            bit_idx   <= 3'd0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    txd <= 1'b1;
+                    if (tx_en && !tx_busy) begin
+                        tx_busy   <= 1'b1;
+                        shift_reg <= tx_data;
+                        baud_cnt  <= 9'd0;
+                        bit_idx   <= 3'd0;
+                        state     <= START;
+                    end
+                end
+
+                START: begin
+                    txd <= 1'b0;                          // 起始位
+                    if (baud_cnt >= BAUD_CNT - 1) begin
+                        baud_cnt <= 9'd0;
+                        state    <= DATA;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                DATA: begin
+                    txd <= shift_reg[0];                  // LSB先发
+                    if (baud_cnt >= BAUD_CNT - 1) begin
+                        baud_cnt  <= 9'd0;
+                        shift_reg <= {1'b0, shift_reg[7:1]};
+                        if (bit_idx >= 3'd7) begin
+                            state <= STOP;
+                        end else
+                            bit_idx <= bit_idx + 1;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                STOP: begin
+                    txd <= 1'b1;                          // 停止位
+                    if (baud_cnt >= BAUD_CNT - 1) begin
+                        baud_cnt <= 9'd0;
+                        tx_busy  <= 1'b0;
+                        state    <= IDLE;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+            endcase
+        end
+    end
 
 endmodule

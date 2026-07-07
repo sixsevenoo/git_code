@@ -62,13 +62,15 @@ set_location_assignment PIN_E1 -to clk
 set_location_assignment PIN_J14 -to rst_n
 set_location_assignment PIN_P16 -to sub_mode
 set_location_assignment PIN_R16 -to mode_sel[0]
+# ===== UART (USB转串口, 请根据板子原理图修改引脚) =====
+set_location_assignment PIN_A7 -to uart_txd
 set_location_assignment PIN_P15 -to mode_sel[1]
 set_location_assignment PIN_J16 -to freq_inc
 set_location_assignment PIN_J15 -to freq_dec
 set_location_assignment PIN_N15 -to fm_dev_sel
 set_location_assignment PIN_A8 -to dac_clk
 set_location_assignment PIN_A9 -to dac_data[13]
-set_location_assignment PIN_D9 -to dac_data[12]
+set_location_assignment PIN_B9 -to dac_data[12]
 set_location_assignment PIN_A11 -to dac_data[11]
 set_location_assignment PIN_B11 -to dac_data[10]
 set_location_assignment PIN_A12 -to dac_data[9]
