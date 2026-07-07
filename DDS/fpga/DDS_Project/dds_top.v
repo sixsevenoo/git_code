@@ -68,14 +68,83 @@ initial begin
 end
 assign sine_data = sin_rom[rom_addr];
 
+// ========== 按键同步、消抖与边沿检测 ==========
+// 20ms @ 50MHz = 1,000,000 周期
+localparam DEBOUNCE_MAX = 20'd999_999;
+
+// 同步链 (2级DFF, 消除亚稳态)
+reg [1:0] inc_sync, dec_sync;
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        inc_sync <= 2'b0;
+        dec_sync <= 2'b0;
+    end else begin
+        inc_sync <= {inc_sync[0], freq_inc};
+        dec_sync <= {dec_sync[0], freq_dec};
+    end
+end
+
+// 消抖计数器: 输入稳定保持约20ms才翻转
+reg inc_stable, dec_stable;
+reg [19:0] inc_db_cnt, dec_db_cnt;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        inc_stable <= 1'b0;
+        inc_db_cnt <= 20'd0;
+    end else begin
+        if (inc_sync[1] != inc_stable) begin
+            if (inc_db_cnt >= DEBOUNCE_MAX) begin
+                inc_db_cnt <= 20'd0;
+                inc_stable <= ~inc_stable;
+            end else
+                inc_db_cnt <= inc_db_cnt + 1'b1;
+        end else
+            inc_db_cnt <= 20'd0;
+    end
+end
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        dec_stable <= 1'b0;
+        dec_db_cnt <= 20'd0;
+    end else begin
+        if (dec_sync[1] != dec_stable) begin
+            if (dec_db_cnt >= DEBOUNCE_MAX) begin
+                dec_db_cnt <= 20'd0;
+                dec_stable <= ~dec_stable;
+            end else
+                dec_db_cnt <= dec_db_cnt + 1'b1;
+        end else
+            dec_db_cnt <= 20'd0;
+    end
+end
+
+// 上升沿检测
+reg inc_prev, dec_prev;
+wire inc_rise, dec_rise;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        inc_prev <= 1'b0;
+        dec_prev <= 1'b0;
+    end else begin
+        inc_prev <= inc_stable;
+        dec_prev <= dec_stable;
+    end
+end
+
+assign inc_rise = inc_stable & ~inc_prev;
+assign dec_rise = dec_stable & ~dec_prev;
+
 // ========== 频率控制字生成 ==========
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
-        freq_code <= 32'd1;
+        freq_code <= 32'd1000;          // 上电默认 100kHz (更实用的初始频率)
     else begin
-        if (freq_inc && (freq_code < 32'd100000))
+        if (inc_rise && (freq_code < 32'd100000))
             freq_code <= freq_code + 1;
-        else if (freq_dec && (freq_code > 32'd1))
+        else if (dec_rise && (freq_code > 32'd1))
             freq_code <= freq_code - 1;
     end
 end
@@ -202,6 +271,7 @@ always @(posedge clk) begin
     dac_data <= dac_data_reg;
 end
 
-assign dac_clk = clk;
+// 将DAC时钟反相，使数据在DAC时钟上升沿前已有半个周期稳定时间
+assign dac_clk = ~clk;
 
 endmodule
