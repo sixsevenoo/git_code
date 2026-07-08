@@ -211,7 +211,7 @@ assign dec_rise = dec_stable & ~dec_prev;
 // ========== 频率控制字生成 ==========
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
-        freq_code <= 32'd1000;          // 上电默认 100kHz (更实用的初始频率)
+        freq_code <= 32'd1;             // 上电默认 100Hz (原始设计值)
     else begin
         if (inc_cmd && (freq_code < 32'd100000))
             freq_code <= freq_code + 1;
