@@ -32,6 +32,22 @@ localparam FTW_STEP = 32'd8590;
 
 wire [7:0] uart_cmd_byte;
 wire       uart_cmd_valid;
+
+// 命令冷却计数器: 每次收到命令后锁定 ~20ms, 防止噪声连续误触发
+reg [19:0] cmd_lockout;
+wire       cmd_allow = (cmd_lockout == 20'd0);
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        cmd_lockout <= 20'd0;
+    end else begin
+        if (uart_cmd_valid && cmd_allow)
+            cmd_lockout <= 20'd999_999;    // ~20ms @ 50MHz 锁定
+        else if (cmd_lockout != 20'd0)
+            cmd_lockout <= cmd_lockout - 1;
+    end
+end
+
 reg        uart_cmd_inc_pulse;
 reg        uart_cmd_dec_pulse;
 reg        uart_cmd_mode_pulse;
@@ -51,7 +67,8 @@ always @(posedge clk or negedge rst_n) begin
         uart_cmd_mode_pulse <= 1'b0;
         uart_cmd_sub_pulse  <= 1'b0;
         uart_cmd_fm_pulse   <= 1'b0;
-        if (uart_cmd_valid) begin
+        // 只有冷却期外且帧有效的命令才接受
+        if (uart_cmd_valid && cmd_allow) begin
             case (uart_cmd_byte)
                 8'h49, 8'h69: uart_cmd_inc_pulse  <= 1'b1;   // 'I'/'i'
                 8'h44, 8'h64: uart_cmd_dec_pulse  <= 1'b1;   // 'D'/'d'
@@ -638,9 +655,15 @@ module uart_rx #(
 
                 STOP: begin
                     if (baud_cnt >= BAUD_CNT - 1) begin
-                        rx_data <= shift_reg;
-                        rx_done <= 1'b1;
-                        state   <= IDLE;
+                        baud_cnt <= 9'd0;
+                        // 帧错误检测: 停止位必须是高电平才接受
+                        // 浮空/噪声产生的无效帧会被丢弃
+                        if (rxd_s2) begin
+                            rx_data <= shift_reg;
+                            rx_done <= 1'b1;
+                        end
+                        // 停止位为低 → 帧错误, 静默丢弃
+                        state <= IDLE;
                     end else
                         baud_cnt <= baud_cnt + 1;
                 end
