@@ -62,11 +62,10 @@ set_location_assignment PIN_E1 -to clk
 set_location_assignment PIN_J14 -to rst_n
 set_location_assignment PIN_P16 -to sub_mode
 set_location_assignment PIN_R16 -to mode_sel[0]
-# ===== UART TX (USB→PC, VOFA+波形显示) =====
+# UART TX (USB to PC)
 set_location_assignment PIN_C3 -to uart_txd
-# ===== UART RX (3519→FPGA, 控制命令输入) =====
+# UART RX (3519 to FPGA command input)
 set_location_assignment PIN_A7 -to uart_rxd
-set_instance_assignment -name WEAK_PULLUP_RESISTOR ON -to uart_rxd
 set_location_assignment PIN_P15 -to mode_sel[1]
 set_location_assignment PIN_J16 -to freq_inc
 set_location_assignment PIN_J15 -to freq_dec

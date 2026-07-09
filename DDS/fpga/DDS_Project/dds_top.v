@@ -33,26 +33,12 @@ localparam FTW_STEP = 32'd8590;
 wire [7:0] uart_cmd_byte;
 wire       uart_cmd_valid;
 
-// 命令冷却计数器: 每次收到命令后锁定 ~20ms, 防止噪声连续误触发
-reg [19:0] cmd_lockout;
-wire       cmd_allow = (cmd_lockout == 20'd0);
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        cmd_lockout <= 20'd0;
-    end else begin
-        if (uart_cmd_valid && cmd_allow)
-            cmd_lockout <= 20'd999_999;    // ~20ms @ 50MHz 锁定
-        else if (cmd_lockout != 20'd0)
-            cmd_lockout <= cmd_lockout - 1;
-    end
-end
-
 reg        uart_cmd_inc_pulse;
 reg        uart_cmd_dec_pulse;
 reg        uart_cmd_mode_pulse;
 reg        uart_cmd_sub_pulse;
 reg        uart_cmd_fm_pulse;
+reg        uart_cmd_rst_pulse;
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -61,21 +47,22 @@ always @(posedge clk or negedge rst_n) begin
         uart_cmd_mode_pulse <= 1'b0;
         uart_cmd_sub_pulse  <= 1'b0;
         uart_cmd_fm_pulse   <= 1'b0;
+        uart_cmd_rst_pulse  <= 1'b0;
     end else begin
-        uart_cmd_inc_pulse  <= 1'b0;   // 默认: 脉宽1周期
+        uart_cmd_inc_pulse  <= 1'b0;
         uart_cmd_dec_pulse  <= 1'b0;
         uart_cmd_mode_pulse <= 1'b0;
         uart_cmd_sub_pulse  <= 1'b0;
         uart_cmd_fm_pulse   <= 1'b0;
-        // 只有冷却期外且帧有效的命令才接受
-        if (uart_cmd_valid && cmd_allow) begin
+        uart_cmd_rst_pulse  <= 1'b0;
+        if (uart_cmd_valid) begin
             case (uart_cmd_byte)
-                8'h49, 8'h69: uart_cmd_inc_pulse  <= 1'b1;   // 'I'/'i'
-                8'h44, 8'h64: uart_cmd_dec_pulse  <= 1'b1;   // 'D'/'d'
-                8'h4D, 8'h6D: uart_cmd_mode_pulse <= 1'b1;   // 'M'/'m'
-                8'h53, 8'h73: uart_cmd_sub_pulse  <= 1'b1;   // 'S'/'s'
-                8'h46, 8'h66: uart_cmd_fm_pulse   <= 1'b1;   // 'F'/'f'
-                // 'R'/'r' 复位直接通过rst_n逻辑处理
+                8'h49, 8'h69: uart_cmd_inc_pulse  <= 1'b1;
+                8'h44, 8'h64: uart_cmd_dec_pulse  <= 1'b1;
+                8'h4D, 8'h6D: uart_cmd_mode_pulse <= 1'b1;
+                8'h53, 8'h73: uart_cmd_sub_pulse  <= 1'b1;
+                8'h46, 8'h66: uart_cmd_fm_pulse   <= 1'b1;
+                8'h52, 8'h72: uart_cmd_rst_pulse  <= 1'b1;
             endcase
         end
     end
@@ -93,12 +80,18 @@ always @(posedge clk or negedge rst_n) begin
         uart_sub_reg  <= 1'b0;
         uart_fm_reg   <= 1'b0;
     end else begin
-        if (uart_cmd_mode_pulse)
-            uart_mode_reg <= uart_mode_reg + 1'b1;   // 循环: 00→01→10→11→00
-        if (uart_cmd_sub_pulse)
-            uart_sub_reg <= ~uart_sub_reg;
-        if (uart_cmd_fm_pulse)
-            uart_fm_reg <= ~uart_fm_reg;
+        if (uart_cmd_rst_pulse) begin              // 'R'命令: 复位所有UART寄存器
+            uart_mode_reg <= 2'b00;
+            uart_sub_reg  <= 1'b0;
+            uart_fm_reg   <= 1'b0;
+        end else begin
+            if (uart_cmd_mode_pulse)
+                uart_mode_reg <= uart_mode_reg + 1'b1;   // 循环: 00→01→10→11→00
+            if (uart_cmd_sub_pulse)
+                uart_sub_reg <= ~uart_sub_reg;
+            if (uart_cmd_fm_pulse)
+                uart_fm_reg <= ~uart_fm_reg;
+        end
     end
 end
 
@@ -137,7 +130,6 @@ wire [13:0] am_out;
 wire [13:0] fm_mod_sin;             // 同 mod_sin
 wire [31:0] fc_ftw;
 wire [31:0] delta_f_ftw;
-wire [13:0] offset;
 wire [31:0] ftw_fm;
 wire [13:0] fm_out;
 
@@ -208,32 +200,48 @@ always @(posedge clk or negedge rst_n) begin
     end
 end
 
-// 上升沿检测
+// 上升沿检测 (带启动锁定, 防止复位后消抖稳定时的误触发)
 reg inc_prev, dec_prev;
 wire inc_rise, dec_rise;
+
+reg [21:0] startup_cnt;
+wire       startup_hold = (startup_cnt < 22'd2_500_000);   // ~50ms @ 50MHz
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         inc_prev <= 1'b0;
         dec_prev <= 1'b0;
+        startup_cnt <= 22'd0;
     end else begin
         inc_prev <= inc_stable;
         dec_prev <= dec_stable;
+        if (startup_hold)
+            startup_cnt <= startup_cnt + 1'b1;
     end
 end
 
-assign inc_rise = inc_stable & ~inc_prev;
-assign dec_rise = dec_stable & ~dec_prev;
+assign inc_rise = inc_stable & ~inc_prev & ~startup_hold;
+assign dec_rise = dec_stable & ~dec_prev & ~startup_hold;
 
 // ========== 频率控制字生成 ==========
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
-        freq_code <= 32'd1;             // 上电默认 100Hz (原始设计值)
+        freq_code <= 32'd1;             // 上电默认 100Hz
+    else if (uart_cmd_rst_pulse)
+        freq_code <= 32'd1;             // 'R'命令: 复位到100Hz
     else begin
-        if (inc_cmd && (freq_code < 32'd100000))
-            freq_code <= freq_code + 1;
-        else if (dec_cmd && (freq_code > 32'd1))
-            freq_code <= freq_code - 1;
+        if (inc_cmd && (freq_code < 32'd100000)) begin
+            if (uart_cmd_inc_pulse)
+                freq_code <= freq_code + 32'd10;   // UART: 1kHz步进
+            else
+                freq_code <= freq_code + 32'd1;    // 按键: 100Hz步进
+        end
+        else if (dec_cmd && (freq_code > 32'd1)) begin
+            if (uart_cmd_dec_pulse)
+                freq_code <= freq_code - 32'd10;   // UART: 1kHz步进
+            else
+                freq_code <= freq_code - 32'd1;    // 按键: 100Hz步进
+        end
     end
 end
 assign FTW = freq_code * FTW_STEP;
@@ -258,7 +266,7 @@ always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
         phase_mod1k <= 0;
     else
-        phase_mod1k <= phase_mod1k + 32'd8590;   // 1kHz 对应FTW
+        phase_mod1k <= phase_mod1k + 32'd85900;  // 1kHz = 10 x 100Hz = 10 x 8590
 end
 
 // ========== AM调制 (载波1MHz, 可扩展) ==========
@@ -285,7 +293,8 @@ end
 assign ma_coeff = (ma_index == 4'd0) ? 14'd0 : (ma_index * 14'd1638);
 wire [27:0] scaled_mod = ma_coeff * mod_sin;
 wire [27:0] bias_plus_mod = scaled_mod + 28'd8192;
-wire [27:0] am_mult = bias_plus_mod[13:0] * am_carrier;
+// BUGFIX: [13:0] → [27:14], 原来取了低14位(全是噪声)，应该取高14位(调制包络)
+wire [27:0] am_mult = bias_plus_mod[27:14] * am_carrier;
 assign am_out = am_mult[27:14];
 
 // ========== FM调制 (中心频率可调，频偏可切换) ==========
@@ -296,12 +305,18 @@ assign fc_ftw = fc_ftw_tmp;
 localparam FTW_5K = 32'd429500;
 localparam FTW_10K = 32'd859000;
 assign delta_f_ftw = fm_dev_eff ? FTW_10K : FTW_5K;
-assign offset = mod_sin - 14'd8192;   // 有符号偏移
 
-// 修正2: 将乘积结果改为32位，避免索引越界
-wire [31:0] ftw_delta_product = offset * delta_f_ftw[13:0];
-wire [31:0] ftw_delta = ftw_delta_product;   // 直接赋值
-assign ftw_fm = fc_ftw + ftw_delta;
+// BUGFIX1: 有符号偏移, FM需要正负方向都能调
+wire signed [13:0] offset_s = $signed(mod_sin) - $signed(14'd8192);
+
+// BUGFIX2: 原来的 delta_f_ftw[13:0] 取了低14位丢弃了有效数据
+// 正确: ftw_delta = offset * delta_f_ftw / 8192
+// 直接做有符号乘法然后右移13位(=除以8192)
+wire signed [45:0] ftw_delta_full = offset_s * $signed({1'b0, delta_f_ftw});
+wire signed [31:0] ftw_delta = ftw_delta_full[44:13];
+
+// fc_ftw转有符号再相加, 保证负向偏移也能正确减小频率
+assign ftw_fm = $unsigned($signed({1'b0, fc_ftw}) + ftw_delta);
 
 reg [31:0] phase_fm;
 wire [13:0] fm_sine;
@@ -573,7 +588,7 @@ endmodule
 
 // ============================================================
 // UART 接收模块 (8N1, 115200bps)
-// 在时钟中点采样, 检测起始位下降沿
+// 使用单计数器方案, 逻辑更清晰
 // ============================================================
 module uart_rx #(
     parameter BAUD_CNT = 434           // 50000000 / 115200 = 434
@@ -585,88 +600,81 @@ module uart_rx #(
     output reg      rx_done
 );
 
-    localparam  BAUD_HALF = BAUD_CNT >> 1;   // 中点: 217
-    localparam  IDLE  = 2'd0,
-                START = 2'd1,
-                DATA  = 2'd2,
-                STOP  = 2'd3;
-
-    reg [1:0] state;
-    reg [8:0] baud_cnt;
-    reg [2:0] bit_idx;
-    reg [7:0] shift_reg;
+    localparam BAUD_HALF = BAUD_CNT >> 1;   // 217
 
     // 同步器 + 下降沿检测
-    reg rxd_s1, rxd_s2, rxd_prev;
+    reg rxd_sync, rxd_prev;
     wire start_edge;
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            rxd_s1 <= 1'b1;
-            rxd_s2 <= 1'b1;
-            rxd_prev <= 1'b1;
-        end else begin
-            rxd_s1   <= rxd;
-            rxd_s2   <= rxd_s1;
-            rxd_prev <= rxd_s2;
-        end
+    always @(posedge clk) begin
+        rxd_sync <= rxd;
+        rxd_prev <= rxd_sync;
     end
-    assign start_edge = rxd_prev & ~rxd_s2;   // 下降沿
+    assign start_edge = rxd_prev & ~rxd_sync;   // 下降沿
+
+    // 接收状态: 0=idle, 1=start, 2..9=data bits 0..7, 10=stop
+    reg [3:0] state;
+    reg [8:0] cnt;
+    reg [7:0] shreg;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state     <= IDLE;
-            baud_cnt  <= 9'd0;
-            bit_idx   <= 3'd0;
-            shift_reg <= 8'd0;
-            rx_data   <= 8'd0;
-            rx_done   <= 1'b0;
+            state   <= 4'd0;
+            cnt     <= 9'd0;
+            shreg   <= 8'd0;
+            rx_data <= 8'd0;
+            rx_done <= 1'b0;
         end else begin
-            rx_done <= 1'b0;                    // 默认: 脉冲1周期
+            rx_done <= 1'b0;                   // rx_done默认脉冲1周期
+
             case (state)
-                IDLE: begin
-                    baud_cnt <= 9'd0;
+                // ============ IDLE ============
+                4'd0: begin
+                    cnt <= 9'd0;
                     if (start_edge)
-                        state <= START;
+                        state <= 4'd1;         // 检测到起始位下降沿
                 end
 
-                START: begin
-                    if (baud_cnt >= BAUD_HALF) begin   // 采样起始位中点
-                        baud_cnt <= 9'd0;
-                        if (!rxd_s2)                    // 仍然是低→有效起始位
-                            state <= DATA;
+                // ============ START ============
+                4'd1: begin
+                    if (cnt >= BAUD_HALF) begin
+                        cnt <= 9'd0;
+                        if (!rxd_sync)          // 起始位中点仍为低 → 有效
+                            state <= 4'd2;      // 开始接收bit0
                         else
-                            state <= IDLE;              // 毛刺, 重新等待
+                            state <= 4'd0;      // 毛刺, 回到IDLE
                     end else
-                        baud_cnt <= baud_cnt + 1;
+                        cnt <= cnt + 1;
                 end
 
-                DATA: begin
-                    if (baud_cnt >= BAUD_CNT - 1) begin
-                        baud_cnt  <= 9'd0;
-                        shift_reg <= {rxd_s2, shift_reg[7:1]};
-                        if (bit_idx >= 3'd7) begin
-                            state <= STOP;
-                        end else
-                            bit_idx <= bit_idx + 1;
+                // ============ DATA bits 0..7 ============
+                4'd2, 4'd3, 4'd4, 4'd5,
+                4'd6, 4'd7, 4'd8, 4'd9: begin
+                    if (cnt >= BAUD_CNT - 1) begin
+                        cnt   <= 9'd0;
+                        // LSB first: 新bit移入MSB
+                        shreg <= {rxd_sync, shreg[7:1]};
+                        state <= state + 1;
                     end else
-                        baud_cnt <= baud_cnt + 1;
+                        cnt <= cnt + 1;
                 end
 
-                STOP: begin
-                    if (baud_cnt >= BAUD_CNT - 1) begin
-                        baud_cnt <= 9'd0;
-                        // 帧错误检测: 停止位必须是高电平才接受
-                        // 浮空/噪声产生的无效帧会被丢弃
-                        if (rxd_s2) begin
-                            rx_data <= shift_reg;
+                // ============ STOP ============
+                4'd10: begin
+                    if (cnt >= BAUD_HALF) begin
+                        cnt   <= 9'd0;
+                        state <= 4'd0;          // 回到IDLE
+                        if (rxd_sync) begin      // 停止位为高 → 有效帧
+                            rx_data <= shreg;
                             rx_done <= 1'b1;
-                        end
-                        // 停止位为低 → 帧错误, 静默丢弃
-                        state <= IDLE;
+                        end                     // 停止位为低 → 帧错误,静默丢弃
                     end else
-                        baud_cnt <= baud_cnt + 1;
+                        cnt <= cnt + 1;
                 end
+
+                // ============ 安全兜底 ============
+                default:
+                    state <= 4'd0;
             endcase
         end
     end
